@@ -96,9 +96,56 @@ func NewErrUnknownNetwork(network string) error {
 	return &ErrUnknownNetwork{network}
 }
 
+// deliveryState describes where an async message is in its delivery lifecycle.
+type deliveryState int32
+
+const (
+	// deliveryPending means the message is queued and has not been sent yet.
+	deliveryPending deliveryState = iota
+	// deliveryInFlight means the message has been written to the connection and,
+	// when RequestAck is enabled, is waiting for its ack.
+	deliveryInFlight
+	// deliveryRetryable means the message was sent but could not be confirmed
+	// (e.g. the connection dropped after the write but before the ack was read)
+	// and will be resent using the same stable chunk id, so fluentd can
+	// deduplicate the retransmission.
+	deliveryRetryable
+	// deliveryAcked means the message was confirmed by fluentd. Terminal state.
+	deliveryAcked
+	// deliveryDropped means the message will not be sent anymore, either because
+	// the retries have been exhausted or because the logger is closed with
+	// ForceStopAsyncSend. Terminal state.
+	deliveryDropped
+)
+
 type msgToSend struct {
 	data []byte
-	ack  string
+	// ack is the stable chunk id generated once per message and reused as-is
+	// across retransmissions, so fluentd can tell a resend apart from a new
+	// message and deduplicate it.
+	ack string
+	// state tracks the deliveryState of the message. Accessed atomically.
+	state int32
+	// callbackOnce ensures the AsyncResultCallback is executed at most once
+	// per message, no matter how many times the message is retransmitted or
+	// how the logger is closed.
+	callbackOnce sync.Once
+}
+
+// setState marks the message with the given delivery state.
+func (m *msgToSend) setState(s deliveryState) {
+	atomic.StoreInt32(&m.state, int32(s))
+}
+
+// finish invokes callback at most once for this message. Every path that
+// reaches a terminal delivery state (acked, dropped, discarded on close) must
+// call finish so that the AsyncResultCallback fires exactly once per message.
+func (m *msgToSend) finish(callback func(data []byte, err error), err error) {
+	m.callbackOnce.Do(func() {
+		if callback != nil {
+			callback(m.data, err)
+		}
+	})
 }
 
 type Fluent struct {
@@ -563,6 +610,10 @@ func (f *Fluent) run(ctx context.Context) {
 				return
 			}
 
+			if entry == nil {
+				continue
+			}
+
 			if f.AsyncReconnectInterval > 0 {
 				if time.Since(f.latestReconnectTime) > time.Duration(f.AsyncReconnectInterval)*time.Millisecond {
 					f.muconn.Lock()
@@ -573,22 +624,31 @@ func (f *Fluent) run(ctx context.Context) {
 			}
 
 			err := f.writeWithRetry(ctx, entry)
-			if err != nil && err != errIsClosing {
+			if err != nil && !errors.Is(err, errIsClosing) {
 				fmt.Fprintf(os.Stderr, "[%s] Unable to send logs to fluentd, reconnecting...\n", time.Now().Format(time.RFC3339))
 			}
-			if f.AsyncResultCallback != nil {
-				var data []byte
-				if entry != nil {
-					data = entry.data
-				}
-				f.AsyncResultCallback(data, err)
-			}
+			entry.finish(f.AsyncResultCallback, err)
 		case <-ctx.Done():
 			// Context was canceled, which means ForceStopAsyncSend was enabled
 			fmt.Fprintf(os.Stderr, "[%s] Discarding queued events...\n", time.Now().Format(time.RFC3339))
+			f.discardPending()
 			f.wg.Done()
 			return
 		}
+	}
+}
+
+// discardPending marks every message still queued as dropped and runs its
+// result callback exactly once. It is only used when ForceStopAsyncSend is
+// enabled: Close() cancels the run() context and then closes f.pending, so
+// ranging over the channel is guaranteed to terminate and cannot deadlock.
+func (f *Fluent) discardPending() {
+	for entry := range f.pending {
+		if entry == nil {
+			continue
+		}
+		entry.setState(deliveryDropped)
+		entry.finish(f.AsyncResultCallback, errIsClosing)
 	}
 }
 
@@ -599,10 +659,14 @@ func e(x, y float64) int {
 func (f *Fluent) writeWithRetry(ctx context.Context, msg *msgToSend) error {
 	for i := 0; i < f.Config.MaxRetry; i++ {
 		if retry, err := f.write(ctx, msg); !retry {
+			if err != nil {
+				msg.setState(deliveryDropped)
+			}
 			return err
 		}
 	}
 
+	msg.setState(deliveryDropped)
 	return fmt.Errorf("fluent#write: failed to write after %d attempts", f.Config.MaxRetry)
 }
 
@@ -683,7 +747,9 @@ func (f *Fluent) write(ctx context.Context, msg *msgToSend) (bool, error) {
 		return false, fmt.Errorf("fluent#write: %w", err)
 	}
 
+	msg.setState(deliveryInFlight)
 	if err := f.syncWriteMessage(ctx, msg); err != nil {
+		msg.setState(deliveryRetryable)
 		f.syncClose(false)
 		return true, fmt.Errorf("fluent#write: %w", err)
 	}
@@ -692,15 +758,21 @@ func (f *Fluent) write(ctx context.Context, msg *msgToSend) (bool, error) {
 	if msg.ack != "" {
 		resp, err := f.syncReadAck(ctx)
 		if err != nil {
+			// The ack was lost: the message may or may not have been stored
+			// by fluentd. Mark it retryable so it is resent with the same
+			// stable chunk id, allowing fluentd to deduplicate it.
+			msg.setState(deliveryRetryable)
 			fmt.Fprintf(os.Stderr, "fluent#write: error reading message response ack %v. Closing connection...", err)
 			f.syncClose(false)
-			return true, err
+			return true, fmt.Errorf("fluent#write: error reading ack: %w", err)
 		}
 		if resp.Ack != msg.ack {
+			msg.setState(deliveryRetryable)
 			fmt.Fprintf(os.Stderr, "fluent#write: message ack (%s) doesn't match expected one (%s). Closing connection...", resp.Ack, msg.ack)
 			f.syncClose(false)
-			return true, err
+			return true, fmt.Errorf("fluent#write: message ack (%s) doesn't match expected one (%s)", resp.Ack, msg.ack)
 		}
+		msg.setState(deliveryAcked)
 	}
 
 	return false, nil

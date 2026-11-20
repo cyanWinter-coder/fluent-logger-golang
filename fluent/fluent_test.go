@@ -862,6 +862,290 @@ func TestPendingChannelThreadSafety(t *testing.T) {
 	wg.Wait()
 }
 
+// asyncResult is used by the async delivery tests below to capture the
+// arguments of AsyncResultCallback calls.
+type asyncResult struct {
+	data []byte
+	err  error
+}
+
+// mustUniqueID returns the deterministic chunk id for the given timestamp.
+// randomGenerator is stubbed in init() so the ids are stable during tests.
+func mustUniqueID(t *testing.T, timeUnix int64) string {
+	t.Helper()
+	id, err := getUniqueID(timeUnix)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	return id
+}
+
+// assertNoExtraCallback asserts the AsyncResultCallback is not called again,
+// i.e. that each message triggers the callback at most once.
+func assertNoExtraCallback(t *testing.T, results chan asyncResult) {
+	t.Helper()
+	select {
+	case r := <-results:
+		t.Fatalf("AsyncResultCallback called more than once: %+v", r)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestAsyncAckMismatchResendsWithSameChunkId(t *testing.T) {
+	t.Parallel()
+
+	d := newTestDialer()
+	results := make(chan asyncResult, 2)
+	f, err := newWithDialer(Config{
+		Async:      true,
+		RequestAck: true,
+		AsyncResultCallback: func(data []byte, err error) {
+			results <- asyncResult{data, err}
+		},
+	}, d)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer f.Close()
+
+	_ = f.EncodeAndPostData("tag_name", time.Unix(1482493046, 0), map[string]string{"foo": "bar"})
+
+	// First attempt: the write succeeds but the ack doesn't match the chunk
+	// id, so the message must be marked retryable and resent.
+	conn := d.waitForNextDialing(true, false)
+	first := conn.waitForNextWrite(true, ackRespMsgp(t, "mismatched-chunk-id"))
+
+	// Second attempt: the ack matches, the message is acknowledged.
+	conn = d.waitForNextDialing(true, false)
+	second := conn.waitForNextWrite(true, ackRespMsgp(t, mustUniqueID(t, 1482493046)))
+
+	// The retransmission must reuse the exact same payload, including the
+	// same stable chunk id, so fluentd can deduplicate it.
+	assertEqual(t, string(first), string(second))
+
+	select {
+	case r := <-results:
+		if r.err != nil {
+			t.Errorf("Expected a nil error, got: %v", r.err)
+		}
+		assertEqual(t, string(r.data), string(first))
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timed out waiting for the async result callback")
+	}
+
+	assertNoExtraCallback(t, results)
+}
+
+func TestAsyncAckLostDropsMessageAfterMaxRetry(t *testing.T) {
+	t.Parallel()
+
+	d := newTestDialer()
+	results := make(chan asyncResult, 2)
+	f, err := newWithDialer(Config{
+		Async:      true,
+		RequestAck: true,
+		MaxRetry:   2,
+		RetryWait:  1,
+		AsyncResultCallback: func(data []byte, err error) {
+			results <- asyncResult{data, err}
+		},
+	}, d)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer f.Close()
+
+	_ = f.EncodeAndPostData("tag_name", time.Unix(1482493046, 0), map[string]string{"foo": "bar"})
+
+	// Both attempts: the write succeeds but the ack can't be decoded (the ack
+	// is lost), so the message is retried and finally dropped.
+	conn := d.waitForNextDialing(true, false)
+	first := conn.waitForNextWrite(true, "not-a-valid-msgpack-ack")
+	conn = d.waitForNextDialing(true, false)
+	second := conn.waitForNextWrite(true, "not-a-valid-msgpack-ack")
+
+	// The retransmission must reuse the same stable chunk id.
+	assertEqual(t, string(first), string(second))
+
+	select {
+	case r := <-results:
+		if r.err == nil {
+			t.Error("Expected a non-nil error for a message dropped after MaxRetry")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timed out waiting for the async result callback")
+	}
+
+	assertNoExtraCallback(t, results)
+}
+
+func TestAsyncForceStopDiscardsQueuedMessagesWithCallback(t *testing.T) {
+	t.Parallel()
+
+	d := newTestDialer()
+	results := make(chan asyncResult, 4)
+	f, err := newWithDialer(Config{
+		Async:              true,
+		ForceStopAsyncSend: true,
+		RequestAck:         true,
+		RetryWait:          1,
+		AsyncResultCallback: func(data []byte, err error) {
+			results <- asyncResult{data, err}
+		},
+	}, d)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Post messages while no dialing is accepted, so one message stays
+	// in-flight in connectWithRetry and the others remain queued.
+	for i := 0; i < 3; i++ {
+		_ = f.EncodeAndPostData("tag_name", time.Unix(1482493046, 0), map[string]string{"foo": "bar"})
+	}
+
+	// Closing must not deadlock even though messages are unconfirmed, and the
+	// queued messages must be marked as dropped with their callback invoked.
+	timeout(t, 10*time.Second, func() { f.Close() }, "failed to close the logger")
+
+	for i := 0; i < 3; i++ {
+		select {
+		case r := <-results:
+			if r.err == nil {
+				t.Error("Expected a non-nil error for a discarded message")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Timed out waiting for the async result callback %d", i)
+		}
+	}
+
+	assertNoExtraCallback(t, results)
+}
+
+func TestAsyncGracefulCloseFlushesPendingMessages(t *testing.T) {
+	t.Parallel()
+
+	d := newTestDialer()
+	results := make(chan asyncResult, 4)
+	f, err := newWithDialer(Config{
+		Async:      true,
+		RequestAck: true,
+		AsyncResultCallback: func(data []byte, err error) {
+			results <- asyncResult{data, err}
+		},
+	}, d)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	_ = f.EncodeAndPostData("tag_name", time.Unix(1482493046, 0), map[string]string{"foo": "bar"})
+	_ = f.EncodeAndPostData("tag_name", time.Unix(1482493050, 0), map[string]string{"bar": "baz"})
+
+	conn := d.waitForNextDialing(true, false)
+	conn.waitForNextWrite(true, ackRespMsgp(t, mustUniqueID(t, 1482493046)))
+	conn.waitForNextWrite(true, ackRespMsgp(t, mustUniqueID(t, 1482493050)))
+
+	// Without ForceStopAsyncSend, Close must wait for the pending messages to
+	// be sent and acknowledged.
+	timeout(t, 10*time.Second, func() { f.Close() }, "failed to close the logger")
+
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-results:
+			if r.err != nil {
+				t.Errorf("Expected a nil error, got: %v", r.err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Timed out waiting for the async result callback %d", i)
+		}
+	}
+
+	assertNoExtraCallback(t, results)
+}
+
+func TestAsyncCloseWhileWaitingForAckCallsCallbackOnce(t *testing.T) {
+	t.Parallel()
+
+	d := newTestDialer()
+	results := make(chan asyncResult, 2)
+	f, err := newWithDialer(Config{
+		Async:              true,
+		RequestAck:         true,
+		ForceStopAsyncSend: true,
+		AsyncResultCallback: func(data []byte, err error) {
+			results <- asyncResult{data, err}
+		},
+	}, d)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	_ = f.EncodeAndPostData("tag_name", time.Unix(1482493046, 0), map[string]string{"foo": "bar"})
+	conn := d.waitForNextDialing(true, true)
+	conn.waitForNextWrite(true, ackRespMsgp(t, mustUniqueID(t, 1482493046)))
+
+	// Close races with the ack read: depending on the scheduling the ack may
+	// be read (nil error) or the connection may be closed first (non-nil
+	// error). Either way the callback must fire exactly once.
+	timeout(t, 30*time.Second, func() { f.Close() }, "failed to close the logger")
+
+	select {
+	case <-results:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timed out waiting for the async result callback")
+	}
+
+	assertNoExtraCallback(t, results)
+}
+
+func TestAsyncBufferFullAndGracefulCloseDoesNotDeadlock(t *testing.T) {
+	t.Parallel()
+
+	d := newTestDialer()
+	results := make(chan asyncResult, 4)
+	f, err := newWithDialer(Config{
+		Async:       true,
+		RequestAck:  true,
+		BufferLimit: 1,
+		AsyncResultCallback: func(data []byte, err error) {
+			results <- asyncResult{data, err}
+		},
+	}, d)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	_ = f.EncodeAndPostData("tag_name", time.Unix(1482493046, 0), map[string]string{"n": "1"})
+
+	// Wait for the first message to be in-flight: the run() goroutine is now
+	// blocked writing it and can't drain the buffer anymore.
+	conn := d.waitForNextDialing(true, false)
+
+	// The buffer holds a single message, so the third post must fail
+	// immediately instead of blocking.
+	_ = f.EncodeAndPostData("tag_name", time.Unix(1482493050, 0), map[string]string{"n": "2"})
+	err = f.EncodeAndPostData("tag_name", time.Unix(1482493054, 0), map[string]string{"n": "3"})
+	assertEqual(t, err, fmt.Errorf("fluent#appendBuffer: Buffer full, limit 1"))
+
+	conn.waitForNextWrite(true, ackRespMsgp(t, mustUniqueID(t, 1482493046)))
+	conn.waitForNextWrite(true, ackRespMsgp(t, mustUniqueID(t, 1482493050)))
+
+	// A graceful Close must flush the buffered message and not deadlock.
+	timeout(t, 10*time.Second, func() { f.Close() }, "deadlock on Close with a full buffer")
+
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-results:
+			if r.err != nil {
+				t.Errorf("Expected a nil error, got: %v", r.err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Timed out waiting for the async result callback %d", i)
+		}
+	}
+
+	assertNoExtraCallback(t, results)
+}
+
 func Benchmark_PostWithShortMessage(b *testing.B) {
 	b.StopTimer()
 	d := newTestDialer()
